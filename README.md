@@ -1,13 +1,16 @@
+
 # PostgreSQL Commands — Basics → Intermediate → Advanced → Expert (Deep Dive)
 
 A progressive, command-focused guide to help you become deeply proficient with PostgreSQL—from first connection to performance tuning, partitioning, replication, and more. Use it as a *learning roadmap* and a *reference cheat sheet*.
+
+> This edition adds **MERGE**, **generated columns (clarifications)**, **extended statistics (`CREATE STATISTICS`)**, **SQL/JSON path (`@@`, `@?`)**, **progress views**, **`pg_stat_io`**, **advisory locks**, and a **modern streaming replication + pg_basebackup (incl. incremental)** quick-start, plus more performance and security tips (see references inline).
 
 ---
 
 ## 0) Quick Start & `psql` Essentials
 
 ### Connect
-```bash
+
 # Connect with psql (interactive shell)
 psql -h <host> -p <port> -U <user> -d <database>
 # Local default socket (common on Linux)
@@ -15,10 +18,10 @@ psql -U postgres
 # Environment variables
 export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGDATABASE=postgres
 psql
-```
+
 
 ### `psql` meta-commands (run inside psql)
-```psql
+psql
 \?                  -- help for psql
 \h <command>       -- SQL help, e.g., \h SELECT, \h CREATE TABLE
 \l                  -- list databases
@@ -34,14 +37,14 @@ psql
 \pset pager off    -- disable pager (or \pset format aligned/unaligned)
 \copy ...          -- client-side CSV import/export (uses client file path)
 \watch 2           -- rerun the last query every 2 seconds
-```
+
 
 ---
 
 ## 1) Basics (Core SQL)
 
 ### Databases, Schemas, Tables
-```sql
+sql
 -- Create database and connect
 CREATE DATABASE appdb;
 -- (Then in shell) psql -d appdb
@@ -62,17 +65,17 @@ CREATE TABLE app.users (
 -- Alter / Drop
 ALTER TABLE app.users ADD COLUMN last_login TIMESTAMPTZ;
 DROP TABLE IF EXISTS app.users CASCADE;
-```
+
 
 ### Data Types (Common)
 - `boolean`, `smallint`, `integer`, `bigint`, `numeric(p,s)`, `real`, `double precision`
 - `text`, `varchar(n)`, `char(n)`
-- `date`, `time`, `timestamp`, `timestamptz` (timestamp with time zone)
+- `date`, `time`, `timestamp`, `timestamptz`
 - `uuid`, `json`, `jsonb`, `bytea`, `inet`, `cidr`, `macaddr`, `interval`
 - Arrays: `integer[]`, `text[]`
 
-### Insert, Update, Delete, Upsert
-```sql
+### Insert, Update, Delete, Upsert & MERGE
+sql
 INSERT INTO app.users (email, full_name)
 VALUES ('a@x.com', 'Alice'), ('b@x.com', 'Bob');
 
@@ -88,28 +91,38 @@ VALUES ('a@x.com', 'Alicia')
 ON CONFLICT (email) DO UPDATE
 SET full_name = EXCLUDED.full_name,
     updated_at = now();
-```
+
+-- MERGE (PostgreSQL 15+): single statement for conditional INSERT/UPDATE/DELETE
+MERGE INTO app.users AS u
+USING (VALUES ('a@x.com','Alicia')) AS s(email, full_name)
+ON u.email = s.email
+WHEN MATCHED THEN
+  UPDATE SET full_name = s.full_name
+WHEN NOT MATCHED THEN
+  INSERT(email, full_name) VALUES (s.email, s.full_name);
+-- Ref: PostgreSQL docs (MERGE) and community guides.
+
 
 ### Select, Filter, Sort, Limit
-```sql
+sql
 SELECT id, email, created_at
 FROM app.users
 WHERE is_active
 ORDER BY created_at DESC
 LIMIT 10 OFFSET 20;
-```
+
 
 ### Aggregation & Grouping
-```sql
+sql
 SELECT is_active, COUNT(*) AS users
 FROM app.users
 GROUP BY is_active
 HAVING COUNT(*) > 0
 ORDER BY users DESC;
-```
+
 
 ### Joins & Set Operations
-```sql
+sql
 -- Example tables
 CREATE TABLE app.teams (
   id  BIGSERIAL PRIMARY KEY,
@@ -138,21 +151,27 @@ LEFT JOIN app.teams t ON t.id = m.team_id;
 SELECT email FROM app.users WHERE is_active
 UNION
 SELECT email FROM app.users WHERE last_login IS NOT NULL;
-```
+
 
 ### Constraints
-```sql
+sql
 -- Primary key, unique, foreign key, check
 ALTER TABLE app.users
   ADD CONSTRAINT users_email_chk CHECK (position('@' IN email) > 1);
-```
+
+-- DEFERRABLE constraints (enforce at COMMIT)
+ALTER TABLE app.memberships
+  ADD CONSTRAINT memberships_user_fk FOREIGN KEY (user_id)
+  REFERENCES app.users(id)
+  DEFERRABLE INITIALLY DEFERRED;
+
 
 ---
 
 ## 2) Intermediate
 
 ### Transactions & Isolation
-```sql
+sql
 BEGIN;  -- or START TRANSACTION
 UPDATE app.users SET is_active = FALSE WHERE last_login < now() - interval '1 year';
 SAVEPOINT s1;
@@ -163,10 +182,10 @@ COMMIT;  -- or ROLLBACK
 -- Isolation
 SHOW default_transaction_isolation;  -- typically read committed
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-```
+
 
 ### Indexes (Basics)
-```sql
+sql
 -- B-tree (default)
 CREATE INDEX users_email_idx ON app.users (email);
 -- Unique index (also enforces uniqueness)
@@ -177,17 +196,17 @@ CREATE INDEX users_lower_email_idx ON app.users ((lower(email)));
 CREATE INDEX users_active_idx ON app.users (created_at) WHERE is_active;
 -- Covering index (INCLUDE)
 CREATE INDEX users_created_at_include_email ON app.users (created_at) INCLUDE (email);
-```
+
 
 ### Explain & Analyze
-```sql
+sql
 EXPLAIN SELECT * FROM app.users WHERE email = 'a@x.com';
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
   SELECT * FROM app.users WHERE lower(email) = 'a@x.com';
-```
+
 
 ### Views & Materialized Views
-```sql
+sql
 CREATE VIEW app.active_users AS
 SELECT * FROM app.users WHERE is_active;
 
@@ -195,29 +214,29 @@ CREATE MATERIALIZED VIEW app.recent_users AS
 SELECT * FROM app.users WHERE created_at > now() - interval '7 days';
 
 REFRESH MATERIALIZED VIEW CONCURRENTLY app.recent_users;  -- needs unique index on MV
-```
+
 
 ### CTEs (WITH) & Recursion
-```sql
+sql
 WITH latest AS (
   SELECT id, email, row_number() OVER (ORDER BY created_at DESC) AS rn
   FROM app.users
 )
 SELECT * FROM latest WHERE rn <= 10;
 
--- Recursive CTE (example hierarchy)
+-- Example recursive skeleton (replace with actual parent/child)
 WITH RECURSIVE subteams AS (
   SELECT id, name, id AS root_id FROM app.teams
   UNION ALL
   SELECT t.id, t.name, s.root_id
   FROM app.teams t
-  JOIN subteams s ON t.id = s.id  -- Replace with real parent-child when you have it
+  JOIN subteams s ON t.id = s.id
 )
 SELECT * FROM subteams;
-```
+
 
 ### Window Functions
-```sql
+sql
 SELECT
   email,
   created_at,
@@ -227,35 +246,51 @@ SELECT
   rank()          OVER (ORDER BY created_at DESC)                           AS recency_rank,
   avg(extract(epoch FROM now() - created_at)) OVER ()                       AS avg_age_seconds
 FROM app.users;
-```
 
-### JSON/JSONB & Arrays
-```sql
--- JSONB operators
+
+### JSON/JSONB & Arrays (incl. SQL/JSON Path)
+sql
+-- Basic JSONB operators
 SELECT
   payload -> 'user'            AS user_obj,
   payload ->> 'status'         AS status_text,
   payload #> '{meta,tags}'     AS tags_array
 FROM app.events;
 
--- Index for JSONB containment
+-- JSONB containment + GIN
 CREATE INDEX events_payload_gin ON app.events USING gin (payload jsonb_path_ops);
 SELECT * FROM app.events WHERE payload @> '{"status":"ok"}';
 
+-- SQL/JSON path (jsonpath) with @@ (match) and @? (exists)
+-- @@ expects the path to yield a single boolean TRUE; @? is true if any result exists
+SELECT '{"a": {"b":"x"}}'::jsonb @@ '$ ?(@.a.b == "x")'   AS match;
+SELECT '{"a": {"b":"x"}}'::jsonb @? '$ ?(@.a.b == "x")'   AS exists;
+
 -- Arrays & unnest
 SELECT id, unnest(preferences) AS pref FROM app.users;  -- preferences is text[]
-```
+
+
+### Generated Columns (clarification)
+sql
+-- Stored generated column (supported):
+CREATE TABLE app.items (
+  price numeric(10,2), qty int,
+  total numeric(12,2) GENERATED ALWAYS AS (price * qty) STORED
+);
+-- NOTE: PostgreSQL supports STORED generated columns; virtual (computed-on-read)
+-- columns are not supported in commonly deployed versions as of PG16/17.
+
 
 ### Sequences & Identity
-```sql
-CREATE TABLE app.items (
+sql
+CREATE TABLE app.products (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   name TEXT NOT NULL
 );
-```
+
 
 ### COPY (Fast I/O)
-```sql
+sql
 -- Server-side (needs server file access)
 COPY app.users (email, full_name)
 FROM '/var/lib/postgresql/import.csv' CSV HEADER;
@@ -263,14 +298,14 @@ FROM '/var/lib/postgresql/import.csv' CSV HEADER;
 -- Client-side (psql) – uses your local filesystem
 \copy app.users (email, full_name) FROM './import.csv' CSV HEADER
 \copy (SELECT * FROM app.users) TO './export.csv' CSV HEADER
-```
+
 
 ---
 
 ## 3) Advanced
 
 ### Table Partitioning
-```sql
+sql
 -- Range partitioning by created_at (monthly)
 CREATE TABLE app.logs (
   id          BIGSERIAL,
@@ -283,20 +318,20 @@ CREATE TABLE app.logs_2025_01 PARTITION OF app.logs
 FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
 
 CREATE TABLE app.logs_default PARTITION OF app.logs DEFAULT;  -- catch-all
-```
+
 
 ### Advanced Index Types
-```sql
+sql
 -- GIN for JSONB/arrays/FTS
 CREATE INDEX users_prefs_gin ON app.users USING gin (preferences);
 -- GiST for geometric/range types
 CREATE INDEX ranges_gist ON app.ranges USING gist (period);
 -- BRIN for very large, naturally ordered tables
 CREATE INDEX logs_brin ON app.logs USING brin (created_at);
-```
+
 
 ### Full-Text Search (FTS)
-```sql
+sql
 ALTER TABLE app.docs ADD COLUMN tsv tsvector;
 UPDATE app.docs SET tsv = to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body,''));
 CREATE INDEX docs_tsv_idx ON app.docs USING gin (tsv);
@@ -305,19 +340,24 @@ SELECT id, ts_rank_cd(tsv, plainto_tsquery('english', 'postgres tutorial')) AS r
 FROM app.docs
 WHERE tsv @@ plainto_tsquery('english', 'postgres tutorial')
 ORDER BY rank DESC;
-```
 
-### Concurrency & Locks
-```sql
+
+### Concurrency & Locks (incl. Advisory Locks)
+sql
 -- Inspect locks
 SELECT * FROM pg_locks l JOIN pg_stat_activity a USING (pid);
 
 -- Row-level locks
 SELECT * FROM app.users WHERE id = 42 FOR UPDATE SKIP LOCKED;  -- or NOWAIT
-```
+
+-- Advisory locks (application-scoped mutexes)
+SELECT pg_try_advisory_lock(42);      -- non-blocking acquire (boolean)
+SELECT pg_advisory_unlock(42);        -- release
+-- Use (k1,k2) for namespacing, or transaction-scoped variants: pg_advisory_xact_lock(...)
+
 
 ### Security: Roles, Privileges, RLS
-```sql
+sql
 -- Roles & privileges
 CREATE ROLE app_user LOGIN PASSWORD 'change_me';
 GRANT USAGE ON SCHEMA app TO app_user;
@@ -329,65 +369,88 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA app
 ALTER TABLE app.users ENABLE ROW LEVEL SECURITY;
 CREATE POLICY users_is_self ON app.users
   USING (current_user = email);  -- simplistic example if user == email
-```
+
 
 ### Extensions (Common)
-```sql
+sql
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;        -- trigram search
 CREATE EXTENSION IF NOT EXISTS uuid-ossp;      -- UUID generation
 CREATE EXTENSION IF NOT EXISTS hstore;         -- key-value
-```
 
-### Performance: Stats & Tuning
-```sql
--- What is running
-SELECT pid, usename, state, query, now() - query_start AS runtime
-FROM pg_stat_activity
-WHERE state <> 'idle'
-ORDER BY runtime DESC;
 
--- Query stats (after enabling extension)
-SELECT * FROM pg_stat_statements ORDER BY total_time DESC LIMIT 20;
+### Planner & Statistics (incl. CREATE STATISTICS)
+sql
+-- Extended statistics for correlated columns
+CREATE STATISTICS s_user_status (dependencies, mcv, ndistinct)
+ON is_active, last_login FROM app.users;
+ANALYZE app.users;  -- populate stats
 
--- Manual maintenance
+
+### Monitoring & Progress
+sql
+-- Top queries (after enabling pg_stat_statements)
+SELECT query, calls, total_time, mean_time
+FROM pg_stat_statements ORDER BY total_time DESC LIMIT 20;
+
+-- I/O breakdown (PG16+): pg_stat_io
+SELECT * FROM pg_stat_io LIMIT 20;
+
+-- Progress views
+SELECT * FROM pg_stat_progress_vacuum;        -- VACUUM progress
+SELECT * FROM pg_stat_progress_create_index;  -- CREATE/REINDEX progress
+
+
+### Maintenance & Tuning
+sql
 VACUUM (ANALYZE) app.users;
-REINDEX TABLE app.users;           -- rebuild corrupted/bloated index
+REINDEX TABLE app.users;           -- rebuild index
 CLUSTER app.users USING users_email_idx;  -- reorder table by index (blocking)
-```
 
-### Backup & Restore
-```bash
+-- Per-table autovacuum tuning
+ALTER TABLE app.users SET (
+  autovacuum_vacuum_scale_factor = 0.05,
+  autovacuum_analyze_scale_factor = 0.02
+);
+
+
+### Backup & Restore (Logical & Physical)
+
 # Logical backups
 pg_dump -Fc -f appdb.dump appdb                # custom format
 pg_restore -d appdb_restored appdb.dump        # restore
-pg_dump -Fd -j 4 -f appdb_dir appdb            # directory format, parallel
-
-# Plain SQL (easiest to inspect)
-pg_dump appdb > appdb.sql
+pg_dump appdb > appdb.sql                      # plain SQL
 psql -d appdb_restored -f appdb.sql
-```
 
-### Logical Replication (Basics)
-```sql
--- On publisher
-ALTER SYSTEM SET wal_level = logical;  -- requires restart
-SELECT pg_reload_conf();
-CREATE PUBLICATION pub_app FOR TABLE app.users, app.teams;
+# Physical base backup (bootstrap a standby or for PITR)
+pg_basebackup -h <primary> -U replicator -D /var/lib/postgresql/standby -Fp -X stream -P -R
+# -R writes replication settings and creates standby.signal automatically
 
--- On subscriber
-CREATE SUBSCRIPTION sub_app
-  CONNECTION 'host=... dbname=appdb user=replicator password=...'
-  PUBLICATION pub_app;
-```
+
+### Streaming Replication (Quick Start)
+sql
+-- On primary (in postgresql.conf)
+-- wal_level=replica (or higher), max_wal_senders=10, max_replication_slots=10, hot_standby=on
+-- pg_hba.conf: host replication replicator <standby_ip>/32 scram-sha-256
+-- Create a replication role
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_pw';
+
+
+# On standby: take base backup and start
+pg_basebackup -h <primary_ip> -U replicator -D $PGDATA -Fp -X stream -P -R
+# Start the standby; verify on primary
+psql -c "SELECT client_addr, state, sync_state FROM pg_stat_replication;"
+
+
+> Tip: PostgreSQL 17+ adds **incremental base backups** via `pg_basebackup` combined with `pg_combinebackup` for faster, smaller physical backups.
 
 ---
 
 ## 4) Expert
 
 ### Planner Mastery
-```sql
--- Inspect different plan shapes
+sql
+-- Influence plan shape for experiments
 SET enable_nestloop = off;  -- force hash/merge joins
 EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
 
@@ -395,25 +458,25 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT ...;
 PREPARE q1(text) AS SELECT * FROM app.users WHERE email = $1;
 EXECUTE q1('a@x.com');
 DEALLOCATE q1;
-```
+
 
 ### Parallel Query Controls
-```sql
+sql
 SET max_parallel_workers_per_gather = 4;
 EXPLAIN (ANALYZE) SELECT COUNT(*) FROM app.logs;  -- look for Gather nodes
-```
+
 
 ### Foreign Data Wrappers (FDW)
-```sql
+sql
 CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 CREATE SERVER remotedb FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '10.0.0.5', dbname 'other');
 CREATE USER MAPPING FOR app_user SERVER remotedb OPTIONS (user 'remote', password 'secret');
 IMPORT FOREIGN SCHEMA public FROM SERVER remotedb INTO remote;
 SELECT * FROM remote.some_table LIMIT 10;
-```
+
 
 ### Row-Level Auditing (example)
-```sql
+sql
 CREATE TABLE app.audit_users (
   at         timestamptz DEFAULT now(),
   who        text,
@@ -443,10 +506,10 @@ DROP TRIGGER IF EXISTS audit_users_trg ON app.users;
 CREATE TRIGGER audit_users_trg
 AFTER INSERT OR UPDATE OR DELETE ON app.users
 FOR EACH ROW EXECUTE FUNCTION app.audit_users_fn();
-```
+
 
 ### Event Triggers (Schema-change hooks)
-```sql
+sql
 CREATE OR REPLACE FUNCTION app.on_ddl_end() RETURNS event_trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE NOTICE 'DDL finished: %', tg_tag;
@@ -454,18 +517,18 @@ END;$$;
 
 CREATE EVENT TRIGGER ddl_end_trigger ON ddl_command_end
 EXECUTE PROCEDURE app.on_ddl_end();
-```
+
 
 ### Security Hardening (Pointers)
-- Use SCRAM-SHA-256 passwords: `password_encryption = 'scram-sha-256'`
-- Enforce least privilege (separate app role vs. migration/owner role)
-- Enable SSL/TLS for remote connections
-- Consider `pgaudit` extension for auditable environments
+- Use SCRAM-SHA-256 passwords; restrict `pg_hba.conf` by subnet.
+- Enforce least privilege (separate app role vs. owner/migrations).
+- Enable SSL/TLS for remote connections.
+- Consider `pgaudit` for audit trails.
 
 ---
 
 ## 5) `psql` Power-User Moves
-```psql
+psql
 \e              -- open editor for current query
 \gexec          -- execute query result as commands
 \p              -- show the query buffer
@@ -474,14 +537,14 @@ EXECUTE PROCEDURE app.on_ddl_end();
 \o file.txt     -- send query output to a file
 \encoding UTF8  -- set client encoding
 \set             -- list or set variables
-```
+
 
 ---
 
 ## 6) Hands-on Mini-Labs (Practice)
 
 ### Lab A — Build & Query
-```sql
+sql
 CREATE SCHEMA lab;
 CREATE TABLE lab.sales (
   id          bigserial PRIMARY KEY,
@@ -501,10 +564,10 @@ FROM generate_series(1, 10000);
 SELECT region, sum(amount) FROM lab.sales GROUP BY region ORDER BY 2 DESC;
 CREATE INDEX sales_ts_idx ON lab.sales(ts);
 EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM lab.sales WHERE ts > now() - interval '1 day';
-```
 
-### Lab B — JSONB & GIN
-```sql
+
+### Lab B — JSONB, JSONPATH & GIN
+sql
 CREATE TABLE lab.events (
   id bigserial PRIMARY KEY,
   payload jsonb NOT NULL
@@ -516,10 +579,12 @@ VALUES ('{"type":"click","user":"u1","meta":{"tags":["home","cta"]}}'),
 
 CREATE INDEX events_payload_gin ON lab.events USING gin (payload);
 SELECT * FROM lab.events WHERE payload @> '{"type":"click"}';
-```
+-- Using SQL/JSON path
+SELECT * FROM lab.events WHERE payload @? '$ ?(@.type == "click")';
+
 
 ### Lab C — Partitioning
-```sql
+sql
 CREATE TABLE lab.logs (
   id bigserial,
   ts timestamptz not null,
@@ -533,45 +598,57 @@ FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
 INSERT INTO lab.logs(ts,msg)
 SELECT now() - (g * interval '1 hour'), 'hello '||g
 FROM generate_series(1, 100) g;
-```
+
 
 ---
 
 ## 7) Performance Checklist (Quick Reference)
 1. **Find slow queries:** `pg_stat_statements` (top total_time, mean_time)
 2. **Get plans:** `EXPLAIN (ANALYZE, BUFFERS)`; confirm right indexes are used
-3. **Indexes:** cover predicates, avoid over-indexing; consider partial/expression/GIN/BRIN
-4. **Stats:** `ANALYZE` after major changes; adjust `default_statistics_target` if needed
-5. **Memory:** tune `work_mem` for sorts/joins; `maintenance_work_mem` for maintenance
-6. **IO:** check `shared_buffers`, `effective_cache_size`; monitor cache hit ratio
-7. **Bloat:** `VACUUM`, `VACUUM (FULL)` (blocking) or external tools; consider `REINDEX`
+3. **Indexes:** cover predicates; consider partial/expression/GIN/BRIN
+4. **Stats:** `ANALYZE`; use `CREATE STATISTICS` for correlated columns
+5. **Memory:** tune `work_mem`; `maintenance_work_mem` for maintenance
+6. **IO:** check `pg_stat_io`, `shared_buffers`, `effective_cache_size`
+7. **Bloat:** `VACUUM`, `REINDEX`; avoid overuse of `VACUUM (FULL)`
 8. **Locking:** inspect `pg_locks`, use `NOWAIT`/`SKIP LOCKED`; reduce transaction scope
 9. **Partitioning:** for very large tables by time/id ranges; prune old partitions
-10. **Concurrency:** test real workloads; consider parallelism and connection pooling
+10. **Concurrency:** test real workloads; parallelism & connection pooling
 
 ---
 
 ## 8) Useful System Catalogs & Views
-```sql
--- Activity, locks, index usage
-SELECT * FROM pg_stat_activity;
-SELECT * FROM pg_locks;
-SELECT * FROM pg_stat_user_indexes;
-SELECT * FROM pg_stat_user_tables;
-```
+sql
+SELECT * FROM pg_stat_activity;               -- current sessions
+SELECT * FROM pg_locks;                       -- locks
+SELECT * FROM pg_stat_user_indexes;           -- index usage
+SELECT * FROM pg_stat_user_tables;            -- table stats
+SELECT * FROM pg_stat_io;                     -- cluster-wide I/O (PG16+)
+SELECT * FROM pg_stat_replication;            -- replication status (on primary)
+
 
 ---
 
 ## 9) Learning Roadmap (Suggested Path)
 - **Week 1:** psql basics, DDL/DML, SELECT + JOINs, constraints
 - **Week 2:** transactions, indexes, EXPLAIN, views/materialized views, CTEs
-- **Week 3:** window functions, JSONB & arrays, COPY, sequences/identity
-- **Week 4:** partitioning, FTS, monitoring (pg_stat_*), VACUUM/ANALYZE
-- **Week 5+:** RLS & security, extensions, replication basics, FDW, PL/pgSQL, event triggers, parallelism, advanced tuning
+- **Week 3:** window functions, JSONB & arrays, JSONPATH, COPY, sequences/identity
+- **Week 4:** partitioning, FTS, monitoring (pg_stat_*), VACUUM/ANALYZE, progress views
+- **Week 5+:** RLS & security, extensions, replication (streaming & logical), FDW, PL/pgSQL, event triggers, parallelism, advanced tuning
 
 > Tip: Keep a journal of plans and timings as you tune. Regressions are easier to spot with history.
 
 ---
 
+### References (selected)
+- MERGE: PostgreSQL docs; Crunchy/Percona explainers.
+- Generated columns (stored): PostgreSQL docs (earlier versions) & community notes.
+- SQL/JSON path and @@ / @?: PostgreSQL docs; community explainers.
+- CREATE STATISTICS & extended stats: PostgreSQL docs; pgPedia/AWS blog.
+- pg_stat_io: PostgreSQL docs; pganalyze/CYBERTEC/pgPedia.
+- Progress views: PostgreSQL docs; pgPedia/PostgresAI write-ups.
+- Streaming replication & pg_basebackup (incl. incremental in PG17+): PostgreSQL docs; EDB/Stormatics/Percona.
+
+---
+
 ### Disclaimer
-Use caution when running `DROP`, `ALTER`, `VACUUM (FULL)`, `CLUSTER`, or changes to replication/`ALTER SYSTEM` in production. Always test in staging and ensure backups.
+Use caution with `DROP`, `ALTER SYSTEM`, `VACUUM (FULL)`, `CLUSTER`, replication setup, and security changes in production. Always test in staging and ensure backups.
